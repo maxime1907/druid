@@ -15,12 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import sys
-import os
-import multiprocessing
 import argparse
-import subprocess
+import math
+import multiprocessing
+import os
 import platform
+import subprocess
+import sys
 
 BASE_CONFIG_PATH = "conf/druid/auto"
 
@@ -96,6 +97,54 @@ HEAP_TO_TOTAL_MEM_RATIO = {
 
 LOGGING_ENABLED = False
 
+def load(path, encoding="utf-8"):
+    """ Loads a file content """
+    with open(path, 'r', encoding=encoding, newline="") as handle:
+        tmp = handle.read()
+    return tmp
+
+def get_cpu_count():
+    try:
+        try:
+            # This is necessary to deduce docker cpu_count
+            cfs_quota_us = cfs_period_us = 0
+            # cgroup2
+            if os.path.exists("/sys/fs/cgroup/cgroup.controllers"):
+                cpu_max = load("/sys/fs/cgroup/cpu.max").split()
+                if cpu_max[0] != "max":
+                    if len(cpu_max) == 1:
+                        cfs_quota_us, cfs_period_us = int(cpu_max[0]), 100_000
+                    else:
+                        cfs_quota_us, cfs_period_us = map(int, cpu_max)
+            else:  # cgroup1
+                cfs_quota_us = int(load("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"))
+                cfs_period_us = int(load("/sys/fs/cgroup/cpu/cpu.cfs_period_us"))
+            if cfs_quota_us > 0 and cfs_period_us > 0:
+                return int(math.ceil(cfs_quota_us / cfs_period_us))
+        except (EnvironmentError, TypeError):
+            pass
+        return multiprocessing.cpu_count()
+    except NotImplementedError:
+        # print("multiprocessing.cpu_count() not implemented. Defaulting to 1 cpu")
+        return 1  # Safe guess
+
+def get_memory_limit():
+    try:
+        # This is necessary to deduce docker memory_limit
+        memory_max = 0
+        # cgroup2
+        if os.path.exists("/sys/fs/cgroup/cgroup.controllers"):
+            memory_max = int(load("/sys/fs/cgroup/memory.max"))
+        else:  # cgroup1
+            memory_max = int(load("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+        if memory_max > 0:
+            return (memory_max/1024/1024)
+    except (EnvironmentError, TypeError):
+        pass
+    physical_memory = get_physical_memory()
+    if physical_memory is None:
+        return 1024  # Safe guess of 1Gb
+    return physical_memory
 
 def print_if_verbose(message):
     if LOGGING_ENABLED:
@@ -391,7 +440,7 @@ def get_physical_memory():
 def convert_total_memory_string(memory):
     try:
         if memory == '':
-            physical_memory = get_physical_memory()
+            physical_memory = get_memory_limit()
 
             if physical_memory is None:
                 raise ValueError('Could not automatically determine memory size. Please explicitly specify the memory argument as --memory=<integer_value><m/g>')
@@ -446,7 +495,9 @@ def build_mm_task_java_opts_array(task_memory):
 
 
 def compute_tasks_memory(allocated_memory):
-    cpu_count = multiprocessing.cpu_count()
+    cpu_count = get_cpu_count()
+
+    print_if_verbose(f'\nDetected CPUs: {cpu_count}')
 
     if allocated_memory >= cpu_count * 1024:
         task_count = cpu_count
